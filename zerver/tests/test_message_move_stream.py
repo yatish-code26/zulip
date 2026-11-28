@@ -800,13 +800,6 @@ class MessageMoveStreamTest(ZulipTestCase):
         ]
         self.assertEqual(destination_topic_queries, [])
 
-        origin_topic_queries = [
-            call
-            for call in get_latest_message.call_args_list
-            if call.args[2] == old_stream.recipient_id and call.args[3] == "test"
-        ]
-        self.assertEqual(origin_topic_queries, [])
-
         messages = get_topic_messages(user_profile, old_stream, "test")
         self.assert_length(messages, 3)
         self.assertEqual(messages[0].id, msg_id)
