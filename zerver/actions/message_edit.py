@@ -40,7 +40,12 @@ from zerver.lib.exceptions import (
 from zerver.lib.internal_event_types import InternalDeleteMessageEvent, InternalUpdateMessageEvent
 from zerver.lib.markdown import MessageRenderingResult, topic_links
 from zerver.lib.markdown import version as markdown_version
-from zerver.lib.mention import MentionBackend, MentionData, silent_mention_syntax_for_user
+from zerver.lib.mention import (
+    ChannelTopicInfo,
+    MentionBackend,
+    MentionData,
+    silent_mention_syntax_for_user,
+)
 from zerver.lib.message import (
     access_message,
     bulk_access_stream_messages_query,
@@ -339,21 +344,28 @@ def maybe_delete_previous_resolve_topic_notification(
 
 
 def get_topic_link_syntax_for_move_notification(
-    stream: Stream, topic_name: str, user_profile: UserProfile
+    stream: Stream,
+    topic_name: str,
+    user_profile: UserProfile,
+    *,
+    cached_message_id: int | None = None,
 ) -> str:
     # The #**channel>topic** syntax gets its `with` operand when it is
     # rendered, so we only look one up when that syntax can't be used.
     with_message_id = None
     if topic_link_needs_fallback_markdown_link(stream.name, topic_name):
-        assert stream.recipient_id is not None
-        with_message_id = get_latest_message_for_user_in_topic(
-            stream.realm_id,
-            user_profile,
-            stream.recipient_id,
-            topic_name,
-            stream.is_history_public_to_subscribers(),
-            acting_user_has_channel_content_access=True,
-        )
+        if cached_message_id is not None:
+            with_message_id = cached_message_id
+        else:
+            assert stream.recipient_id is not None
+            with_message_id = get_latest_message_for_user_in_topic(
+                stream.realm_id,
+                user_profile,
+                stream.recipient_id,
+                topic_name,
+                stream.is_history_public_to_subscribers(),
+                acting_user_has_channel_content_access=True,
+            )
     return get_stream_topic_link_syntax(
         stream.id, stream.name, topic_name, with_message_id=with_message_id
     )
@@ -385,9 +397,46 @@ def send_message_moved_breadcrumbs(
     }
     moved_message_link = stream_message_url(target_message.realm, message)
 
+    mention_backend = MentionBackend(target_message.realm_id)
+    mention_backend.topic_cache[ChannelTopicInfo(new_stream.name, new_topic_name)] = (
+        target_message.id
+    )
+
+    if old_thread_notification_string is not None:
+        new_topic_link = get_topic_link_syntax_for_move_notification(
+            new_stream,
+            new_topic_name,
+            user_profile,
+            cached_message_id=target_message.id,
+        )
+        with override_language(old_stream.realm.default_language):
+            # Send a notification to the old stream that the topic was moved.
+            old_notice_id = internal_send_stream_message(
+                sender,
+                old_stream,
+                old_topic_name,
+                old_thread_notification_string.format(
+                    user=user_mention,
+                    new_location=new_topic_link,
+                    changed_messages_count=changed_messages_count,
+                ),
+                mark_as_read_for_acting_user=True,
+                acting_user=user_profile,
+                mention_backend=mention_backend,
+            )
+            if old_notice_id is not None:
+                mention_backend.topic_cache[
+                    ChannelTopicInfo(old_stream.name, old_topic_name)
+                ] = old_notice_id
+
     if new_thread_notification_string is not None:
         old_topic_link = get_topic_link_syntax_for_move_notification(
-            old_stream, old_topic_name, user_profile
+            old_stream,
+            old_topic_name,
+            user_profile,
+            cached_message_id=mention_backend.topic_cache.get(
+                ChannelTopicInfo(old_stream.name, old_topic_name)
+            ),
         )
         with override_language(new_stream.realm.default_language):
             internal_send_stream_message(
@@ -402,25 +451,7 @@ def send_message_moved_breadcrumbs(
                 ),
                 mark_as_read_for_acting_user=True,
                 acting_user=user_profile,
-            )
-
-    if old_thread_notification_string is not None:
-        new_topic_link = get_topic_link_syntax_for_move_notification(
-            new_stream, new_topic_name, user_profile
-        )
-        with override_language(old_stream.realm.default_language):
-            # Send a notification to the old stream that the topic was moved.
-            internal_send_stream_message(
-                sender,
-                old_stream,
-                old_topic_name,
-                old_thread_notification_string.format(
-                    user=user_mention,
-                    new_location=new_topic_link,
-                    changed_messages_count=changed_messages_count,
-                ),
-                mark_as_read_for_acting_user=True,
-                acting_user=user_profile,
+                mention_backend=mention_backend,
             )
 
 
